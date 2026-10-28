@@ -1,0 +1,123 @@
+{
+  "Comment": "Heavy lane: OCR (Textract async, task-token wait) and very large documents. Execution name = doc_id.",
+  "QueryLanguage": "JSONata",
+  "StartAt": "Plan",
+  "States": {
+    "Plan": {
+      "Type": "Task",
+      "Comment": "Malware gate, decide native / ocr_full / ocr_selective / ocr_split, cut OCR parts.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Arguments": { "FunctionName": "${plan_arn}", "Payload": { "doc": "{% $states.input.doc %}" } },
+      "Retry": [
+        { "ErrorEquals": ["ScanPending"], "IntervalSeconds": 60, "MaxAttempts": 10, "BackoffRate": 1.5 },
+        { "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2, "JitterStrategy": "FULL" }
+      ],
+      "Catch": [ { "ErrorEquals": ["States.ALL"], "Next": "MarkFailed",
+                   "Output": "{% $merge([$states.input, {'error': $states.errorOutput}]) %}" } ],
+      "Output": "{% $merge([$states.input, {'plan': $states.result.Payload}]) %}",
+      "Next": "NeedsOcr"
+    },
+    "NeedsOcr": {
+      "Type": "Choice",
+      "Choices": [ { "Condition": "{% $states.input.plan.mode = 'native' %}", "Next": "Collect" } ],
+      "Default": "OcrParts"
+    },
+    "OcrParts": {
+      "Type": "Map",
+      "Comment": "One Textract job per part (usually 1). Waits for SNS -> textract_complete -> SendTaskSuccess.",
+      "Items": "{% $states.input.plan.ocr_parts %}",
+      "ItemSelector": { "doc": "{% $states.input.doc %}", "part": "{% $states.context.Map.Item.Value %}" },
+      "MaxConcurrency": 5,
+      "ItemProcessor": {
+        "ProcessorConfig": { "Mode": "INLINE" },
+        "StartAt": "StartOcr",
+        "States": {
+          "StartOcr": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+            "Arguments": {
+              "FunctionName": "${start_ocr_part_arn}",
+              "Payload": {
+                "doc": "{% $states.input.doc %}",
+                "part": "{% $states.input.part %}",
+                "task_token": "{% $states.context.Task.Token %}"
+              }
+            },
+            "TimeoutSeconds": 7200,
+            "Retry": [
+              { "ErrorEquals": ["TextractBusy"], "IntervalSeconds": 30, "MaxAttempts": 8, "BackoffRate": 2,
+                "MaxDelaySeconds": 900, "JitterStrategy": "FULL" }
+            ],
+            "End": true
+          }
+        }
+      },
+      "Catch": [ { "ErrorEquals": ["States.ALL"], "Next": "MarkFailed",
+                   "Output": "{% $merge([$states.input, {'error': $states.errorOutput}]) %}" } ],
+      "Output": "{% $merge([$states.input, {'ocr': $states.result}]) %}",
+      "Next": "Collect"
+    },
+    "Collect": {
+      "Type": "Task",
+      "Comment": "Merge OCR + native pages, write pages.jsonl, plan 200-page ranges.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Arguments": {
+        "FunctionName": "${collect_arn}",
+        "Payload": {
+          "doc": "{% $states.input.doc %}",
+          "plan": "{% $states.input.plan %}",
+          "ocr": "{% $exists($states.input.ocr) ? $states.input.ocr : [] %}"
+        }
+      },
+      "Retry": [ { "ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 5, "MaxAttempts": 2, "BackoffRate": 2 } ],
+      "Catch": [ { "ErrorEquals": ["States.ALL"], "Next": "MarkFailed",
+                   "Output": "{% $merge([$states.input, {'error': $states.errorOutput}]) %}" } ],
+      "Output": "{% $merge([$states.input, {'collect': $states.result.Payload}]) %}",
+      "Next": "ChunkRanges"
+    },
+    "ChunkRanges": {
+      "Type": "Map",
+      "Comment": "Distributed Map: a 9,800-page catalogue becomes 49 parallel child executions.",
+      "Items": "{% $states.input.collect.ranges %}",
+      "ItemSelector": { "doc": "{% $states.input.doc %}", "range": "{% $states.context.Map.Item.Value %}" },
+      "MaxConcurrency": 20,
+      "ToleratedFailurePercentage": 0,
+      "ItemProcessor": {
+        "ProcessorConfig": { "Mode": "DISTRIBUTED", "ExecutionType": "EXPRESS" },
+        "StartAt": "ChunkRange",
+        "States": {
+          "ChunkRange": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Arguments": { "FunctionName": "${chunk_range_arn}", "Payload": "{% $states.input %}" },
+            "Retry": [ { "ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2 } ],
+            "Output": "{% $states.result.Payload %}",
+            "End": true
+          }
+        }
+      },
+      "Catch": [ { "ErrorEquals": ["States.ALL"], "Next": "MarkFailed",
+                   "Output": "{% $merge([$states.input, {'error': $states.errorOutput}]) %}" } ],
+      "Output": "{% $states.input %}",
+      "Next": "Finalize"
+    },
+    "Finalize": {
+      "Type": "Task",
+      "Comment": "Gather range chunk files, record the chunk total, enqueue embed batches.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Arguments": { "FunctionName": "${finalize_arn}", "Payload": { "doc": "{% $states.input.doc %}" } },
+      "Retry": [ { "ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 5, "MaxAttempts": 3, "BackoffRate": 2 } ],
+      "Catch": [ { "ErrorEquals": ["States.ALL"], "Next": "MarkFailed",
+                   "Output": "{% $merge([$states.input, {'error': $states.errorOutput}]) %}" } ],
+      "End": true
+    },
+    "MarkFailed": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Arguments": { "FunctionName": "${mark_failed_arn}", "Payload": "{% $states.input %}" },
+      "Next": "Failed"
+    },
+    "Failed": { "Type": "Fail", "Error": "IngestionFailed", "Cause": "See the document state item and logs" }
+  }
+}

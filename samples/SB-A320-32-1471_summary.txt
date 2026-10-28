@@ -1,0 +1,6 @@
+SERVICE BULLETIN SB A320-32-1471 Rev 02 (SYNTHETIC SUMMARY)
+Subject: Main landing gear - brake wear indicator pin - replacement with improved pin.
+Effectivity: A320neo family MSN 10001-10999.
+Reason: Reports of wear pins bending during wheel change, giving a wrong wear reading.
+Compliance: Recommended at next wheel change. Reference AMM TASK 32-42-27-200-801.
+Parts: P/N C20195000-2 replaces P/N C20195000-1.
